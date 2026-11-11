@@ -1,0 +1,71 @@
+#!/bin/bash
+# Privileged helper for SoftRouterToggle. Only sets a service's IPv4 router/DNS.
+# Compatible with macOS /bin/bash 3.2.
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 --ping" >&2
+  echo "       $0 --service NAME --ip IP --mask MASK --router IP [--dns IP|Empty]" >&2
+  exit 2
+}
+
+is_ipv4() {
+  local ip=$1
+  printf '%s' "$ip" | /usr/bin/grep -Eq '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || return 1
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $ip
+  [ $# -eq 4 ] || return 1
+  local n
+  for n in "$1" "$2" "$3" "$4"; do
+    if [ "$n" -lt 0 ] || [ "$n" -gt 255 ]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+is_service() {
+  printf '%s' "$1" | /usr/bin/grep -Eq '^[A-Za-z0-9][-A-Za-z0-9 /._+]{0,62}$'
+}
+
+if [ "${1-}" = "--ping" ]; then
+  exit 0
+fi
+
+service="" ip="" mask="" router="" dns=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --service) service=${2-}; shift 2 ;;
+    --ip) ip=${2-}; shift 2 ;;
+    --mask) mask=${2-}; shift 2 ;;
+    --router) router=${2-}; shift 2 ;;
+    --dns) dns=${2-}; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+[ -n "$service" ] && [ -n "$ip" ] && [ -n "$mask" ] && [ -n "$router" ] || usage
+if ! is_service "$service"; then
+  echo "invalid service name" >&2
+  exit 3
+fi
+if ! is_ipv4 "$ip" || ! is_ipv4 "$mask" || ! is_ipv4 "$router"; then
+  echo "invalid IPv4 address" >&2
+  exit 4
+fi
+if [ -n "$dns" ] && [ "$dns" != "Empty" ]; then
+  if ! is_ipv4 "$dns"; then
+    echo "invalid DNS" >&2
+    exit 5
+  fi
+fi
+
+/usr/sbin/networksetup -setmanual "$service" "$ip" "$mask" "$router"
+if [ -n "$dns" ]; then
+  if [ "$dns" = "Empty" ]; then
+    /usr/sbin/networksetup -setdnsservers "$service" Empty
+  else
+    /usr/sbin/networksetup -setdnsservers "$service" "$dns"
+  fi
+fi
