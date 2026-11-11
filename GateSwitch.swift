@@ -45,6 +45,15 @@ final class GatewayModel: ObservableObject {
     @Published var services: [String] = []
 
     private var refreshTimer: Timer?
+    // Invalidates a status poll that started before a toggle, so it cannot
+    // write the old gateway back over the knob while it is sliding.
+    private var epoch = 0
+    private var refreshInFlight = false
+    private var applyInFlight = false
+    private var applyToken = 0
+    private static let workQueue = DispatchQueue(label: "com.ming.GateSwitch.network", qos: .userInitiated)
+    /// Hold popover layout changes until the knob has finished sliding.
+    private static let switchAnimationDuration: TimeInterval = 0.35
 
     init() {
         Self.migrateDefaultsIfNeeded()
@@ -59,8 +68,7 @@ final class GatewayModel: ObservableObject {
         }
         Self.migrateLaunchAgentIfNeeded()
         launchAtLogin = FileManager.default.fileExists(atPath: Self.launchAgentURL.path)
-        refresh(silent: true)
-        helperReady = Self.isHelperReady()
+        publish(Self.readSnapshot(service: service), silent: true, updateSwitch: true)
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.refresh(silent: true)
         }
@@ -78,19 +86,21 @@ final class GatewayModel: ObservableObject {
     }
 
     func refresh(silent: Bool = false) {
-        services = Self.listServices()
-        if let info = Self.interfaceInfo(service: service) {
-            currentIP = info.ip
-            currentMask = info.mask
-            currentRouter = info.router
-            currentDNS = Self.dnsServers(service: service)
-            isOn = info.router == onGateway
-            if !silent {
-                errorMessage = nil
+        // The timer runs in .common, including while the switch is tracking.
+        // networksetup / sudo must stay off the main thread or the knob freezes.
+        if applyInFlight || refreshInFlight { return }
+        refreshInFlight = true
+        let started = epoch
+        let serviceName = service
+        Self.workQueue.async { [weak self] in
+            let snapshot = Self.readSnapshot(service: serviceName)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.refreshInFlight = false
+                guard !self.applyInFlight, self.epoch == started else { return }
+                self.publish(snapshot, silent: silent, updateSwitch: true)
             }
         }
-        helperReady = Self.isHelperReady()
-        launchAtLogin = FileManager.default.fileExists(atPath: Self.launchAgentURL.path)
     }
 
     var statusText: String {
@@ -107,8 +117,7 @@ final class GatewayModel: ObservableObject {
     }
 
     func setOn(_ on: Bool) {
-        let target = on ? onGateway : offGateway
-        apply(router: target)
+        apply(router: on ? onGateway : offGateway)
     }
 
     func apply(router: String) {
@@ -118,50 +127,153 @@ final class GatewayModel: ObservableObject {
             showSettings = true
             return
         }
-        refresh(silent: true)
-        let ip = currentIP
-        let mask = currentMask.isEmpty ? "255.255.255.0" : currentMask
-        guard Self.isIPv4(ip), Self.isIPv4(mask) else {
-            errorMessage = "读不到当前 IP，请先确认 \(service) 已连上网"
+        // Ignore a second click until this one finishes. isOn stays where the
+        // knob already is, so the switch does not bounce back and forth.
+        if applyInFlight {
             return
         }
 
-        busy = true
-        errorMessage = nil
-        statusMessage = "正在切换网关…"
+        let previousOn = isOn
+        // Move the knob now, before any process waits. busy / status stay put
+        // until the slide finishes: a progress row resizes the popover and
+        // cuts the animation off.
+        isOn = (router == onGateway)
+        epoch += 1
+        applyInFlight = true
+        applyToken += 1
+        let token = applyToken
         let serviceName = service
-        let shouldSyncDNS = syncDNS
-        let dns = shouldSyncDNS ? router : ""
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Never call networksetup directly from the app: macOS would ask
-            // for the admin password on every toggle. After one helper install,
-            // switches go through sudo -n and stay silent.
-            let result: Result<Void, Error>
-            if Self.isHelperReady() {
-                result = Self.runHelper(service: serviceName, ip: ip, mask: mask, router: router, dns: dns)
-            } else {
-                result = Self.installHelperAndApply(
-                    service: serviceName, ip: ip, mask: mask, router: router, dns: dns
-                )
-            }
-            DispatchQueue.main.async {
+        let dns = syncDNS ? router : ""
+        let requestedAt = Date()
+
+        Self.workQueue.async { [weak self] in
+            let outcome = Self.performNetworkChange(service: serviceName, router: router, dns: dns)
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.busy = false
-                self.refresh(silent: true)
-                switch result {
-                case .success:
-                    self.statusMessage = self.isOn ? "已切换到软路由" : "已切回主路由"
-                    self.errorMessage = nil
-                    if self.currentRouter != router {
-                        self.errorMessage = "命令已执行，但当前网关还是 \(self.currentRouter.isEmpty ? "空的" : self.currentRouter)"
-                        self.statusMessage = nil
-                    }
-                case .failure(let error):
-                    self.statusMessage = nil
-                    self.errorMessage = error.localizedDescription
+                let remaining = Self.switchAnimationDuration - Date().timeIntervalSince(requestedAt)
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(0.0, remaining)) { [weak self] in
+                    self?.finishApply(outcome, router: router, previousOn: previousOn, token: token)
                 }
             }
         }
+
+        // Just after a fast result lands, so the progress row does not flash in
+        // and resize the popover at the end of the slide.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.switchAnimationDuration + 0.05) { [weak self] in
+            guard let self, self.applyToken == token, self.applyInFlight else { return }
+            self.busy = true
+            self.errorMessage = nil
+            self.statusMessage = "正在切换网关…"
+        }
+    }
+
+    private func finishApply(_ outcome: NetworkOutcome, router: String, previousOn: Bool, token: Int) {
+        guard applyToken == token else { return }
+        let snapshot = outcome.snapshot
+        epoch += 1
+        applyInFlight = false
+        busy = false
+        switch outcome.result {
+        case .success:
+            publish(snapshot, silent: true, updateSwitch: false)
+            if snapshot.hasInterface {
+                let resolvedOn = snapshot.router == onGateway
+                if isOn != resolvedOn {
+                    isOn = resolvedOn
+                }
+            }
+            if snapshot.hasInterface, snapshot.router != router {
+                errorMessage = "命令已执行，但当前网关还是 \(snapshot.router.isEmpty ? "空的" : snapshot.router)"
+                statusMessage = nil
+            } else {
+                statusMessage = isOn ? "已切换到软路由" : "已切回主路由"
+                errorMessage = nil
+            }
+        case .failure(let error):
+            publish(snapshot, silent: true, updateSwitch: false)
+            if isOn != previousOn {
+                isOn = previousOn
+            }
+            statusMessage = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func publish(_ snapshot: InterfaceSnapshot, silent: Bool, updateSwitch: Bool) {
+        services = snapshot.services
+        if snapshot.hasInterface {
+            currentIP = snapshot.ip
+            currentMask = snapshot.mask
+            currentRouter = snapshot.router
+            currentDNS = snapshot.dns
+            if updateSwitch {
+                isOn = snapshot.router == onGateway
+            }
+            if !silent {
+                errorMessage = nil
+            }
+        }
+        helperReady = snapshot.helperReady
+        launchAtLogin = snapshot.launchAtLogin
+    }
+
+    private struct InterfaceSnapshot {
+        var services: [String] = []
+        var ip = ""
+        var mask = ""
+        var router = ""
+        var dns = ""
+        var helperReady = false
+        var launchAtLogin = false
+        var hasInterface = false
+    }
+
+    private struct NetworkOutcome {
+        var result: Result<Void, Error>
+        var snapshot: InterfaceSnapshot
+    }
+
+    private static func readSnapshot(service: String) -> InterfaceSnapshot {
+        let info = interfaceInfo(service: service)
+        return InterfaceSnapshot(
+            services: listServices(),
+            ip: info?.ip ?? "",
+            mask: info?.mask ?? "",
+            router: info?.router ?? "",
+            dns: dnsServers(service: service),
+            helperReady: isHelperReady(),
+            launchAtLogin: FileManager.default.fileExists(atPath: launchAgentURL.path),
+            hasInterface: info != nil
+        )
+    }
+
+    private static func performNetworkChange(service: String, router: String, dns: String) -> NetworkOutcome {
+        // Never call networksetup directly from the app: macOS would ask
+        // for the admin password on every toggle. After one helper install,
+        // switches go through sudo -n and stay silent.
+        guard let info = interfaceInfo(service: service) else {
+            return NetworkOutcome(
+                result: .failure(SimpleError("读不到当前 IP，请先确认 \(service) 已连上网")),
+                snapshot: readSnapshot(service: service)
+            )
+        }
+        let ip = info.ip
+        let mask = info.mask.isEmpty ? "255.255.255.0" : info.mask
+        guard isIPv4(ip), isIPv4(mask) else {
+            return NetworkOutcome(
+                result: .failure(SimpleError("读不到当前 IP，请先确认 \(service) 已连上网")),
+                snapshot: readSnapshot(service: service)
+            )
+        }
+        let result: Result<Void, Error>
+        if isHelperReady() {
+            result = runHelper(service: service, ip: ip, mask: mask, router: router, dns: dns)
+        } else {
+            result = installHelperAndApply(
+                service: service, ip: ip, mask: mask, router: router, dns: dns
+            )
+        }
+        return NetworkOutcome(result: result, snapshot: readSnapshot(service: service))
     }
 
     static var launchAgentURL: URL {
