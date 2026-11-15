@@ -21,7 +21,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -parse-as-library -O \
   -target arm64-apple-macosx13.0 \
   -sdk "$SDK" \
-  -framework SwiftUI -framework AppKit \
+  -framework SwiftUI -framework AppKit -framework Network \
   -o "$APP/Contents/MacOS/GateSwitch" \
   "$ROOT/GateSwitch.swift"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"

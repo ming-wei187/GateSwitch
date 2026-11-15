@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import Network
 
 @main
 struct GateSwitchApp: App {
@@ -23,6 +24,7 @@ final class GatewayModel: ObservableObject {
     static let helperPath = "/usr/local/libexec/soft-router-toggle"
     static let sudoersPath = "/etc/sudoers.d/soft-router-toggle"
     static let legacySuite = "com.ming.SoftRouterToggle"
+    static let homeSSIDKey = "homeSSID"
     static let defaultOnGateway = ""
     static let defaultOffGateway = ""
     static let defaultService = "Wi-Fi"
@@ -45,12 +47,22 @@ final class GatewayModel: ObservableObject {
     @Published var services: [String] = []
 
     private var refreshTimer: Timer?
+    private let pathMonitor = NWPathMonitor()
     // Invalidates a status poll that started before a toggle, so it cannot
     // write the old gateway back over the knob while it is sliding.
     private var epoch = 0
     private var refreshInFlight = false
     private var applyInFlight = false
     private var applyToken = 0
+    private var dhcpRestoreInFlight = false
+    // A refresh loop must not keep asking for the admin password. At most one
+    // install attempt is made until the user acts or the helper becomes ready.
+    private var dhcpInstallAttempted = false
+    private var networkPathSatisfied = true
+    private var offlineDHCPRestoreSettled = false
+    // Remembered only after a successful manual switch, never as an empty value.
+    private var homeSSID = ""
+    private var lastInterfaceService = ""
     private static let workQueue = DispatchQueue(label: "com.ming.GateSwitch.network", qos: .userInitiated)
     /// Hold popover layout changes until the knob has finished sliding.
     private static let switchAnimationDuration: TimeInterval = 0.35
@@ -66,15 +78,36 @@ final class GatewayModel: ObservableObject {
         } else {
             syncDNS = d.bool(forKey: "syncDNS")
         }
+        homeSSID = d.string(forKey: Self.homeSSIDKey) ?? ""
         Self.migrateLaunchAgentIfNeeded()
         launchAtLogin = FileManager.default.fileExists(atPath: Self.launchAgentURL.path)
-        publish(Self.readSnapshot(service: service), silent: true, updateSwitch: true)
+        let initialSnapshot = Self.readSnapshot(service: service)
+        publish(initialSnapshot, silent: true, updateSwitch: true)
+        restoreDHCPIfNeeded(snapshot: initialSnapshot)
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.refresh(silent: true)
         }
         if let timer = refreshTimer {
             RunLoop.main.add(timer, forMode: .common)
         }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            // networksetup stays on workQueue; the callback only asks for a refresh.
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let satisfied = (path.status == .satisfied)
+                if satisfied {
+                    self.offlineDHCPRestoreSettled = false
+                }
+                self.networkPathSatisfied = satisfied
+                self.refresh(silent: true)
+            }
+        }
+        pathMonitor.start(queue: Self.workQueue)
+    }
+
+    deinit {
+        pathMonitor.cancel()
+        refreshTimer?.invalidate()
     }
 
     func persist() {
@@ -83,12 +116,15 @@ final class GatewayModel: ObservableObject {
         d.set(onGateway, forKey: "onGateway")
         d.set(offGateway, forKey: "offGateway")
         d.set(syncDNS, forKey: "syncDNS")
+        if !homeSSID.isEmpty {
+            d.set(homeSSID, forKey: Self.homeSSIDKey)
+        }
     }
 
     func refresh(silent: Bool = false) {
         // The timer runs in .common, including while the switch is tracking.
         // networksetup / sudo must stay off the main thread or the knob freezes.
-        if applyInFlight || refreshInFlight { return }
+        if applyInFlight || refreshInFlight || dhcpRestoreInFlight { return }
         refreshInFlight = true
         let started = epoch
         let serviceName = service
@@ -97,8 +133,101 @@ final class GatewayModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.refreshInFlight = false
-                guard !self.applyInFlight, self.epoch == started else { return }
+                guard !self.applyInFlight, !self.dhcpRestoreInFlight,
+                      self.epoch == started, self.service == serviceName else { return }
                 self.publish(snapshot, silent: silent, updateSwitch: true)
+                self.restoreDHCPIfNeeded(snapshot: snapshot)
+            }
+        }
+    }
+
+    private func restoreDHCPIfNeeded(snapshot: InterfaceSnapshot) {
+        if snapshot.helperReady {
+            dhcpInstallAttempted = false
+        }
+        let router: String
+        let ip: String
+        let mask: String
+        let ssid: String
+        if snapshot.hasInterface {
+            router = snapshot.router
+            ip = snapshot.ip
+            mask = snapshot.mask
+            ssid = snapshot.ssid
+        } else if !networkPathSatisfied,
+                  snapshot.service == service,
+                  lastInterfaceService == snapshot.service {
+            // Disconnected after leaving home: keep the last known config long
+            // enough to clear a leftover manual gateway.
+            router = currentRouter
+            ip = currentIP
+            mask = currentMask
+            ssid = ""
+        } else {
+            return
+        }
+        let home = networkPathSatisfied && Self.isHomeNetwork(
+            ssid: ssid,
+            ip: ip,
+            mask: mask,
+            onGateway: onGateway,
+            offGateway: offGateway,
+            homeSSID: homeSSID
+        )
+        // A home gateway can only be left behind by setmanual. Match it before
+        // touching DHCP, so a normal external DHCP router is left alone.
+        guard !home, Self.isHomeGateway(router, onGateway: onGateway, offGateway: offGateway) else { return }
+        if !networkPathSatisfied {
+            // One offline attempt per disconnected episode; user actions can
+            // still ask for another one explicitly.
+            guard !offlineDHCPRestoreSettled else { return }
+        }
+        if !snapshot.helperReady && dhcpInstallAttempted { return }
+        let allowInstall = !snapshot.helperReady && !dhcpInstallAttempted
+        if allowInstall {
+            dhcpInstallAttempted = true
+        }
+        if !networkPathSatisfied {
+            offlineDHCPRestoreSettled = true
+        }
+        startDHCPRestore(service: service, resetDNS: syncDNS, allowInstall: allowInstall)
+    }
+
+    private func startDHCPRestore(service: String, resetDNS: Bool, allowInstall: Bool) {
+        guard !applyInFlight, !dhcpRestoreInFlight else { return }
+        dhcpRestoreInFlight = true
+        epoch += 1
+        let serviceName = service
+        Self.workQueue.async { [weak self] in
+            let outcome = Self.performDHCPRestore(service: serviceName, resetDNS: resetDNS, allowInstall: allowInstall)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.dhcpRestoreInFlight = false
+                guard !self.applyInFlight else { return }
+                self.epoch += 1
+                self.publish(outcome.snapshot, silent: true, updateSwitch: true)
+                switch outcome.result {
+                case .success:
+                    if !self.networkPathSatisfied {
+                        // We restored while offline. Forget the stale manual
+                        // gateway so the next refresh does not restore again.
+                        self.lastInterfaceService = ""
+                        self.currentRouter = ""
+                        self.currentIP = ""
+                        self.currentMask = ""
+                    }
+                    self.statusMessage = "已离开家里的网络，已恢复自动获取"
+                    self.errorMessage = nil
+                case .failure(let error):
+                    if !self.networkPathSatisfied {
+                        // Do not keep retrying against a stale offline state.
+                        self.lastInterfaceService = ""
+                    }
+                    self.statusMessage = nil
+                    if self.errorMessage != error.localizedDescription {
+                        self.errorMessage = error.localizedDescription
+                    }
+                }
             }
         }
     }
@@ -129,7 +258,7 @@ final class GatewayModel: ObservableObject {
         }
         // Ignore a second click until this one finishes. isOn stays where the
         // knob already is, so the switch does not bounce back and forth.
-        if applyInFlight {
+        if applyInFlight || dhcpRestoreInFlight {
             return
         }
 
@@ -144,10 +273,24 @@ final class GatewayModel: ObservableObject {
         let token = applyToken
         let serviceName = service
         let dns = syncDNS ? router : ""
+        let resetDNS = syncDNS
+        let rememberedSSID = homeSSID
+        let pathSatisfied = networkPathSatisfied
+        let currentOnGateway = onGateway
+        let currentOffGateway = offGateway
         let requestedAt = Date()
 
         Self.workQueue.async { [weak self] in
-            let outcome = Self.performNetworkChange(service: serviceName, router: router, dns: dns)
+            let outcome = Self.performNetworkChange(
+                service: serviceName,
+                router: router,
+                dns: dns,
+                resetDNS: resetDNS,
+                homeSSID: rememberedSSID,
+                pathSatisfied: pathSatisfied,
+                onGateway: currentOnGateway,
+                offGateway: currentOffGateway
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let remaining = Self.switchAnimationDuration - Date().timeIntervalSince(requestedAt)
@@ -182,6 +325,9 @@ final class GatewayModel: ObservableObject {
                     isOn = resolvedOn
                 }
             }
+            if !snapshot.ssid.isEmpty {
+                homeSSID = snapshot.ssid
+            }
             if snapshot.hasInterface, snapshot.router != router {
                 errorMessage = "命令已执行，但当前网关还是 \(snapshot.router.isEmpty ? "空的" : snapshot.router)"
                 statusMessage = nil
@@ -191,17 +337,29 @@ final class GatewayModel: ObservableObject {
             }
         case .failure(let error):
             publish(snapshot, silent: true, updateSwitch: false)
-            if isOn != previousOn {
+            if outcome.rejectedNotHome, snapshot.hasInterface {
+                // Snap back to the gateway that is really in use now.
+                isOn = snapshot.router == onGateway
+            } else if isOn != previousOn {
                 isOn = previousOn
             }
-            statusMessage = nil
-            errorMessage = error.localizedDescription
+            if outcome.rejectedNotHome, !snapshot.helperReady, outcome.attemptedInstall {
+                dhcpInstallAttempted = true
+            }
+            if outcome.restoredDHCP {
+                statusMessage = "当前不在家里的网络，不能切换网关，已恢复自动获取"
+                errorMessage = nil
+            } else {
+                statusMessage = nil
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
     private func publish(_ snapshot: InterfaceSnapshot, silent: Bool, updateSwitch: Bool) {
         services = snapshot.services
         if snapshot.hasInterface {
+            lastInterfaceService = snapshot.service
             currentIP = snapshot.ip
             currentMask = snapshot.mask
             currentRouter = snapshot.router
@@ -214,15 +372,20 @@ final class GatewayModel: ObservableObject {
             }
         }
         helperReady = snapshot.helperReady
+        if snapshot.helperReady {
+            dhcpInstallAttempted = false
+        }
         launchAtLogin = snapshot.launchAtLogin
     }
 
     private struct InterfaceSnapshot {
+        var service = ""
         var services: [String] = []
         var ip = ""
         var mask = ""
         var router = ""
         var dns = ""
+        var ssid = ""
         var helperReady = false
         var launchAtLogin = false
         var hasInterface = false
@@ -231,30 +394,95 @@ final class GatewayModel: ObservableObject {
     private struct NetworkOutcome {
         var result: Result<Void, Error>
         var snapshot: InterfaceSnapshot
+        var restoredDHCP = false
+        var rejectedNotHome = false
+        var attemptedInstall = false
+    }
+
+    private struct RestoreOutcome {
+        var result: Result<Void, Error>
+        var snapshot: InterfaceSnapshot
     }
 
     private static func readSnapshot(service: String) -> InterfaceSnapshot {
         let info = interfaceInfo(service: service)
-        return InterfaceSnapshot(
+        return makeSnapshot(service: service, info: info, ssid: currentSSID(service: service))
+    }
+
+    private static func makeSnapshot(
+        service: String,
+        info: (ip: String, mask: String, router: String)?,
+        ssid: String
+    ) -> InterfaceSnapshot {
+        InterfaceSnapshot(
+            service: service,
             services: listServices(),
             ip: info?.ip ?? "",
             mask: info?.mask ?? "",
             router: info?.router ?? "",
             dns: dnsServers(service: service),
+            ssid: ssid,
             helperReady: isHelperReady(),
             launchAtLogin: FileManager.default.fileExists(atPath: launchAgentURL.path),
             hasInterface: info != nil
         )
     }
 
-    private static func performNetworkChange(service: String, router: String, dns: String) -> NetworkOutcome {
+    private static func performNetworkChange(
+        service: String,
+        router: String,
+        dns: String,
+        resetDNS: Bool,
+        homeSSID: String,
+        pathSatisfied: Bool,
+        onGateway: String,
+        offGateway: String
+    ) -> NetworkOutcome {
+        let info = interfaceInfo(service: service)
+        let ssid = currentSSID(service: service)
+        let initialSnapshot = makeSnapshot(service: service, info: info, ssid: ssid)
         // Never call networksetup directly from the app: macOS would ask
         // for the admin password on every toggle. After one helper install,
         // switches go through sudo -n and stay silent.
-        guard let info = interfaceInfo(service: service) else {
+        guard let info else {
             return NetworkOutcome(
                 result: .failure(SimpleError("读不到当前 IP，请先确认 \(service) 已连上网")),
-                snapshot: readSnapshot(service: service)
+                snapshot: initialSnapshot
+            )
+        }
+        let home = pathSatisfied && isHomeNetwork(
+            ssid: ssid,
+            ip: info.ip,
+            mask: info.mask,
+            onGateway: onGateway,
+            offGateway: offGateway,
+            homeSSID: homeSSID
+        )
+        if !home {
+            if isHomeGateway(info.router, onGateway: onGateway, offGateway: offGateway) {
+                // A manual home gateway survived the network change. Restore
+                // DHCP before refusing the switch, but never call setmanual.
+                let needsInstall = !isHelperReady()
+                let restore = performDHCPRestore(service: service, resetDNS: resetDNS, allowInstall: true)
+                let message: String
+                switch restore.result {
+                case .success:
+                    message = "当前不在家里的网络，不能切换网关，已恢复自动获取"
+                case .failure(let error):
+                    message = "当前不在家里的网络，不能切换网关；恢复自动获取失败：\(error.localizedDescription)"
+                }
+                return NetworkOutcome(
+                    result: .failure(SimpleError(message)),
+                    snapshot: restore.snapshot,
+                    restoredDHCP: isSuccess(restore.result),
+                    rejectedNotHome: true,
+                    attemptedInstall: needsInstall
+                )
+            }
+            return NetworkOutcome(
+                result: .failure(SimpleError("当前不在家里的网络，不能切换网关")),
+                snapshot: initialSnapshot,
+                rejectedNotHome: true
             )
         }
         let ip = info.ip
@@ -262,7 +490,7 @@ final class GatewayModel: ObservableObject {
         guard isIPv4(ip), isIPv4(mask) else {
             return NetworkOutcome(
                 result: .failure(SimpleError("读不到当前 IP，请先确认 \(service) 已连上网")),
-                snapshot: readSnapshot(service: service)
+                snapshot: initialSnapshot
             )
         }
         let result: Result<Void, Error>
@@ -273,7 +501,30 @@ final class GatewayModel: ObservableObject {
                 service: service, ip: ip, mask: mask, router: router, dns: dns
             )
         }
-        return NetworkOutcome(result: result, snapshot: readSnapshot(service: service))
+        let snapshot = readSnapshot(service: service)
+        if isSuccess(result), !snapshot.ssid.isEmpty {
+            rememberHomeSSID(snapshot.ssid)
+        }
+        return NetworkOutcome(result: result, snapshot: snapshot)
+    }
+
+    private static func performDHCPRestore(service: String, resetDNS: Bool, allowInstall: Bool) -> RestoreOutcome {
+        let result: Result<Void, Error>
+        if isHelperReady() {
+            result = runHelperDHCP(service: service, resetDNS: resetDNS)
+        } else if allowInstall {
+            result = installHelperAndDHCP(service: service, resetDNS: resetDNS)
+        } else {
+            result = .failure(SimpleError("权限组件需要更新，暂时没有恢复自动获取"))
+        }
+        return RestoreOutcome(result: result, snapshot: readSnapshot(service: service))
+    }
+
+    private static func isSuccess(_ result: Result<Void, Error>) -> Bool {
+        if case .success = result {
+            return true
+        }
+        return false
     }
 
     static var launchAgentURL: URL {
@@ -377,6 +628,97 @@ final class GatewayModel: ObservableObject {
         }
     }
 
+    static func rememberHomeSSID(_ ssid: String) {
+        guard !ssid.isEmpty else { return }
+        UserDefaults.standard.set(ssid, forKey: homeSSIDKey)
+    }
+
+    static func currentSSID(service: String) -> String {
+        // Prefer the hardware port name ("Wi-Fi"); fall back to its Device
+        // (en0) for systems where -getairportnetwork needs the BSD name.
+        let direct = ssidField(shell("/usr/sbin/networksetup", ["-getairportnetwork", service]))
+        if !direct.isEmpty {
+            return direct
+        }
+        if let device = hardwarePortDevice(service: service) {
+            let viaDevice = ssidField(shell("/usr/sbin/networksetup", ["-getairportnetwork", device]))
+            if !viaDevice.isEmpty {
+                return viaDevice
+            }
+        }
+        return ""
+    }
+
+    static func ssidField(_ output: String) -> String {
+        for raw in output.split(separator: "\n") {
+            let line = String(raw)
+            if let value = field(line, prefix: "Current Wi-Fi Network:") {
+                return value
+            }
+        }
+        return ""
+    }
+
+    static func hardwarePortDevice(service: String) -> String? {
+        let output = shell("/usr/sbin/networksetup", ["-listallhardwareports"])
+        var matched = false
+        for raw in output.split(separator: "\n") {
+            let line = String(raw)
+            if let value = field(line, prefix: "Hardware Port:") {
+                matched = (value == service)
+            } else if matched, let value = field(line, prefix: "Device:"), !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    static func isHomeNetwork(
+        ssid: String,
+        ip: String,
+        mask: String,
+        onGateway: String,
+        offGateway: String,
+        homeSSID: String
+    ) -> Bool {
+        // A readable SSID and a remembered home SSID are the strongest signal:
+        // a different network is not home even if its subnet happens to match.
+        if !ssid.isEmpty, !homeSSID.isEmpty {
+            return ssid == homeSSID
+        }
+        // No usable SSID (wired, permission-limited, not associated), or the
+        // first switch before a home SSID has been remembered.
+        guard isIPv4(ip), isIPv4(onGateway), isIPv4(offGateway) else { return false }
+        let effectiveMask = mask.isEmpty ? "255.255.255.0" : mask
+        guard isIPv4(effectiveMask) else { return false }
+        return sameSubnet(ip: ip, mask: effectiveMask, gateway: onGateway)
+            || sameSubnet(ip: ip, mask: effectiveMask, gateway: offGateway)
+    }
+
+    static func isHomeGateway(_ router: String, onGateway: String, offGateway: String) -> Bool {
+        guard isIPv4(router) else { return false }
+        return router == onGateway || router == offGateway
+    }
+
+    static func sameSubnet(ip: String, mask: String, gateway: String) -> Bool {
+        guard let ipNumber = ipValue(ip),
+              let maskNumber = ipValue(mask),
+              let gatewayNumber = ipValue(gateway) else {
+            return false
+        }
+        return (ipNumber & maskNumber) == (gatewayNumber & maskNumber)
+    }
+
+    static func ipValue(_ ip: String) -> UInt32? {
+        guard isIPv4(ip) else { return nil }
+        var value: UInt32 = 0
+        for part in ip.split(separator: ".") {
+            guard let number = UInt32(part) else { return nil }
+            value = (value << 8) | number
+        }
+        return value
+    }
+
     static func runHelper(service: String, ip: String, mask: String, router: String, dns: String) -> Result<Void, Error> {
         var args = ["-n", helperPath, "--service", service, "--ip", ip, "--mask", mask, "--router", router]
         if !dns.isEmpty {
@@ -385,7 +727,31 @@ final class GatewayModel: ObservableObject {
         return run("/usr/bin/sudo", args)
     }
 
+    static func runHelperDHCP(service: String, resetDNS: Bool) -> Result<Void, Error> {
+        var args = ["-n", helperPath, "--dhcp", "--service", service]
+        if resetDNS {
+            args += ["--dns", "Empty"]
+        }
+        return run("/usr/bin/sudo", args)
+    }
+
     static func installHelperAndApply(service: String, ip: String, mask: String, router: String, dns: String) -> Result<Void, Error> {
+        var command = "\(shQuote(helperPath)) --service \(shQuote(service)) --ip \(shQuote(ip)) --mask \(shQuote(mask)) --router \(shQuote(router))"
+        if !dns.isEmpty {
+            command += " --dns \(shQuote(dns))"
+        }
+        return installHelper(command: command)
+    }
+
+    static func installHelperAndDHCP(service: String, resetDNS: Bool) -> Result<Void, Error> {
+        var command = "\(shQuote(helperPath)) --dhcp --service \(shQuote(service))"
+        if resetDNS {
+            command += " --dns Empty"
+        }
+        return installHelper(command: command)
+    }
+
+    private static func installHelper(command: String) -> Result<Void, Error> {
         guard let helperSource = Bundle.main.path(forResource: "soft-router-toggle", ofType: nil) else {
             return .failure(SimpleError("找不到内置的权限组件"))
         }
@@ -405,7 +771,7 @@ final class GatewayModel: ObservableObject {
         SUDOERS
         /bin/chmod 440 \(shQuote(sudoersPath))
         /usr/sbin/visudo -cf \(shQuote(sudoersPath))
-        \(shQuote(helperPath)) --service \(shQuote(service)) --ip \(shQuote(ip)) --mask \(shQuote(mask)) --router \(shQuote(router))\(dns.isEmpty ? "" : " --dns \(shQuote(dns))")
+        \(command)
         """
 
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("soft-router-toggle-install.sh")
