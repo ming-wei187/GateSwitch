@@ -1,11 +1,12 @@
 #!/bin/bash
-# Privileged helper for SoftRouterToggle. Only sets a service's IPv4 router/DNS.
+# Privileged helper for SoftRouterToggle. Only sets a service's IPv4 mode/router/DNS.
 # Compatible with macOS /bin/bash 3.2.
 set -euo pipefail
 
 usage() {
   echo "usage: $0 --ping" >&2
   echo "       $0 --service NAME --ip IP --mask MASK --router IP [--dns IP|Empty]" >&2
+  echo "       $0 --dhcp --service NAME [--dns IP|Empty]" >&2
   exit 2
 }
 
@@ -33,17 +34,48 @@ if [ "${1-}" = "--ping" ]; then
   exit 0
 fi
 
+mode="manual"
 service="" ip="" mask="" router="" dns=""
+has_ip="" has_mask="" has_router=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --dhcp) mode="dhcp"; shift ;;
     --service) service=${2-}; shift 2 ;;
-    --ip) ip=${2-}; shift 2 ;;
-    --mask) mask=${2-}; shift 2 ;;
-    --router) router=${2-}; shift 2 ;;
+    --ip) ip=${2-}; has_ip=1; shift 2 ;;
+    --mask) mask=${2-}; has_mask=1; shift 2 ;;
+    --router) router=${2-}; has_router=1; shift 2 ;;
     --dns) dns=${2-}; shift 2 ;;
     *) usage ;;
   esac
 done
+
+if [ "$mode" = "dhcp" ]; then
+  [ -n "$service" ] || usage
+  # --dhcp must not be mixed with the manual configuration arguments.
+  if [ -n "$has_ip" ] || [ -n "$has_mask" ] || [ -n "$has_router" ]; then
+    usage
+  fi
+  if ! is_service "$service"; then
+    echo "invalid service name" >&2
+    exit 3
+  fi
+  if [ -n "$dns" ] && [ "$dns" != "Empty" ]; then
+    if ! is_ipv4 "$dns"; then
+      echo "invalid DNS" >&2
+      exit 5
+    fi
+  fi
+
+  /usr/sbin/networksetup -setdhcp "$service"
+  if [ -n "$dns" ]; then
+    if [ "$dns" = "Empty" ]; then
+      /usr/sbin/networksetup -setdnsservers "$service" Empty
+    else
+      /usr/sbin/networksetup -setdnsservers "$service" "$dns"
+    fi
+  fi
+  exit 0
+fi
 
 [ -n "$service" ] && [ -n "$ip" ] && [ -n "$mask" ] && [ -n "$router" ] || usage
 if ! is_service "$service"; then
